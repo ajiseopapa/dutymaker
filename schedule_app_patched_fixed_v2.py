@@ -1,0 +1,1284 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
+import datetime
+import pandas as pd
+import calendar
+import json
+import random
+import math
+import logging
+
+# ========================================================================
+# 1. 설정 및 상수
+# ========================================================================
+TOSS_BLUE = '#0066FF'
+WORK_DUTIES = ['D', 'E', 'N', 'DH']
+DAILY_LIMITS = {'D': 2, 'E': 2, 'N': 1, 'DH': 1}
+PRESERVED_SHIFTS = ['V', 'v.25', 'v.0.5', 'MD']
+EDITABLE_SHIFTS = ['D', 'E', 'N', 'O', 'V', 'v.25', 'v.0.5', 'MD', 'DH', '']
+
+WINDOW_WIDTH, WINDOW_HEIGHT = 1600, 600
+CURRENT_YEAR = datetime.datetime.now().year
+CURRENT_MONTH = datetime.datetime.now().month
+WORKER_LIST_FILE = 'worker_names.json'
+PREV_MONTH_SCHEDULE_FILE = 'prev_month_schedule.json'
+MONTHLY_SCHEDULES_FILE = 'monthly_schedules.json'
+ANNUAL_VACATION_FILE = 'annual_vacations.json'
+
+DEFAULT_WORKERS = ["도은아", "구진아", "김정화", "이현주", "강효선", "천보람", "지연정", "이소라", "김수빈", "문수빈", "최민정", "문오순"]
+
+WORKER_CATEGORIES = ['일반', '수선생님', 'C', 'A']
+DEFAULT_CATEGORY = '일반'
+WORKER_CATEGORIES_FILE = 'worker_categories.json'
+
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s:%(message)s')
+
+# ========================================================================
+# 2. 메인 애플리케이션 클래스
+# ========================================================================
+
+class ScheduleApp:
+    def __init__(self, root):
+        self.root = root
+        self.worker_names = []
+        self.worker_categories_map = {}
+        self.monthly_schedules = {}
+        self.current_schedule_df = pd.DataFrame()
+        self.current_summary_df = pd.DataFrame()
+        self.manual_edited_cells = set()
+        self.trace_id = None
+        self.current_tree = None
+        self.prev_month_last_day_duties = {}
+
+        # 연차 데이터 (근무자: 남은연차)
+        self.annual_vacations = {}
+
+        # [데이터 로드]
+        self.load_worker_names()
+        self.load_prev_month_schedule()
+        self.load_worker_categories()
+        self.load_annual_vacations()  # 🔵 NEW: 연차 파일 불러오기
+
+        # [UI 변수]
+        self.year_var = tk.IntVar(value=CURRENT_YEAR)
+        self.month_var = tk.IntVar(value=CURRENT_MONTH)
+        self.month_label_text = tk.StringVar()
+        self.is_head_nurse_mode = tk.BooleanVar(value=True)
+
+        # [UI 설정]
+        self.setup_main_window()
+
+    # ------------------------------------------------------------------
+    # [연차(휴가) 저장/불러오기] 🔵 NEW
+    # ------------------------------------------------------------------
+    def load_annual_vacations(self):
+        """annual_vacations.json에서 연차를 불러오고, 근무자 리스트 기준으로 초기화/동기화"""
+        try:
+            with open(ANNUAL_VACATION_FILE, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    self.annual_vacations = loaded
+                else:
+                    self.annual_vacations = {}
+        except Exception:
+            # 파일이 없거나 포맷 문제일 경우 기본값 설정
+            self.annual_vacations = {}
+
+        # 근무자 목록과 동기화: 새로운 근무자는 기본값(21.5) 부여, 삭제된 근무자 키는 제거
+        for name in self.worker_names:
+            if name not in self.annual_vacations:
+                self.annual_vacations[name] = 21.5
+        # 삭제된 이름 제거
+        keys_to_remove = [k for k in self.annual_vacations.keys() if k not in self.worker_names]
+        for k in keys_to_remove:
+            del self.annual_vacations[k]
+        self.save_annual_vacations()
+
+    def save_annual_vacations(self):
+        """현재 self.annual_vacations를 파일에 저장"""
+        try:
+            with open(ANNUAL_VACATION_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.annual_vacations, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logging.error(f"save_annual_vacations: {e}")
+
+    # ------------------------------------------------------------------
+    # [데이터 관리: 저장/불러오기 - 기존]
+    # ------------------------------------------------------------------
+    def load_all_schedules(self):
+        try:
+            with open(MONTHLY_SCHEDULES_FILE, 'r', encoding='utf-8') as f:
+                self.monthly_schedules = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.monthly_schedules = {}
+            logging.info(f"[{MONTHLY_SCHEDULES_FILE}] 파일이 없거나 형식 오류. 새 딕셔너리 생성.")
+        except Exception as e:
+            logging.error(f"load_all_schedules: {e}")
+
+    def save_all_schedules(self):
+        try:
+            with open(MONTHLY_SCHEDULES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.monthly_schedules, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logging.error(f"save_all_schedules: {e}")
+
+    def save_current_schedule_to_memory(self, df_schedule, year, month):
+        key = f"{year}-{month:02d}"
+        data_to_save = {
+            'columns': df_schedule.columns.tolist(),
+            'index': df_schedule.index.tolist(),
+            'data': df_schedule.values.tolist(),
+            'manual_edits': list(self.manual_edited_cells)
+        }
+        self.monthly_schedules[key] = data_to_save
+        self.save_all_schedules()
+
+    def load_schedule_from_memory(self, year, month):
+        key = f"{year}-{month:02d}"
+        if key in self.monthly_schedules:
+            data = self.monthly_schedules[key]
+            df = pd.DataFrame(data['data'], index=data['index'], columns=data['columns'])
+            manual_edits_list = data.get('manual_edits', [])
+            manual_edits_set = set(tuple(item) for item in manual_edits_list)
+            return df, manual_edits_set
+        return None, set()
+
+    def save_worker_names(self):
+        try:
+            with open(WORKER_LIST_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.worker_names, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logging.error(f"save_worker_names: {e}")
+
+    def load_worker_names(self):
+        try:
+            with open(WORKER_LIST_FILE, 'r', encoding='utf-8') as f:
+                loaded_names = json.load(f)
+                if loaded_names and isinstance(loaded_names, list):
+                    self.worker_names = loaded_names
+                    return
+        except Exception as e:
+            logging.info(f"[초기값 사용] load_worker_names: {e}")
+        self.worker_names = DEFAULT_WORKERS.copy()
+        self.save_worker_names()
+
+    def save_worker_categories(self):
+        try:
+            with open(WORKER_CATEGORIES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.worker_categories_map, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logging.error(f"save_worker_categories: {e}")
+
+    def load_worker_categories(self):
+        try:
+            with open(WORKER_CATEGORIES_FILE, 'r', encoding='utf-8') as f:
+                loaded_map = json.load(f)
+                if loaded_map and isinstance(loaded_map, dict):
+                    self.worker_categories_map = loaded_map
+        except Exception:
+            logging.info(f"[초기값 사용] load_worker_categories: 파일 없음.")
+        updated_map = {}
+        for name in self.worker_names:
+            updated_map[name] = self.worker_categories_map.get(name, DEFAULT_CATEGORY)
+        self.worker_categories_map = updated_map
+
+    def save_prev_month_schedule(self):
+        if self.current_schedule_df.empty: return
+        try:
+            df = self.current_schedule_df
+            last_5_days_df = df.iloc[:, -5:]
+            last_day_duties_list = {worker: row.tolist() for worker, row in last_5_days_df.iterrows()}
+            with open(PREV_MONTH_SCHEDULE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(last_day_duties_list, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            logging.error(f"save_prev_month_schedule: {e}")
+
+    def load_prev_month_schedule(self):
+        try:
+            with open(PREV_MONTH_SCHEDULE_FILE, 'r', encoding='utf-8') as f:
+                self.prev_month_last_day_duties = json.load(f)
+        except Exception as e:
+            logging.info(f"load_prev_month_schedule: 이전 달 근무표 없음. {e}")
+            self.prev_month_last_day_duties = {}
+
+    def save_schedule_to_excel(self):
+        if self.current_schedule_df.empty:
+            messagebox.showwarning("경고", "저장할 근무표 데이터가 없습니다. 근무표를 먼저 생성해 주세요.")
+            return
+
+        year, month = self.year_var.get(), self.month_var.get()
+        default_filename = f"{year}년_{month}월_근무표.xlsx"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=default_filename,
+            filetypes=[("Excel files", "*.xlsx")],
+            title="근무표 및 통계 저장"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with pd.ExcelWriter(file_path, engine='xlsxwriter') as writer:
+                df_schedule_reset = self.current_schedule_df.reset_index(names=['근무자'])
+                df_schedule_reset.to_excel(writer, sheet_name='근무표', index=False)
+
+                workbook = writer.book
+                worksheet_schedule = writer.sheets['근무표']
+                worksheet_schedule.freeze_panes(1, 1)
+
+                if not self.current_summary_df.empty:
+                    df_summary_reset = self.current_summary_df.copy()
+                    df_summary_reset.to_excel(writer, sheet_name='근무_통계', index=False)
+                    worksheet_summary = writer.sheets['근무_통계']
+                    worksheet_summary.freeze_panes(1, 0)
+
+            messagebox.showinfo("저장 성공", f"근무표와 통계를 '{file_path}'에 성공적으로 저장했습니다.")
+            logging.info(f"Excel saved to: {file_path}")
+
+        except ImportError:
+            messagebox.showerror("저장 오류", "xlsxwriter 라이브러리가 설치되어 있지 않습니다.\n'pip install xlsxwriter'를 실행해주세요.")
+            logging.error("xlsxwriter not installed.")
+        except Exception as e:
+            messagebox.showerror("저장 오류", f"엑셀 파일 저장 중 오류가 발생했습니다.\n오류: {e}")
+            logging.error(f"Error saving to Excel: {e}")
+
+    # ------------------------------------------------------------------
+    # [근무자 UI 관리]
+    # ------------------------------------------------------------------
+    def update_gui_after_worker_change(self):
+        """근무자 추가/삭제/순서 변경시 UI 및 연차 동기화"""
+        # 연차 맵 동기화: 새 근무자에 기본 연차 부여, 삭제된 근무자 제거
+        for name in self.worker_names:
+            if name not in self.annual_vacations:
+                self.annual_vacations[name] = 21.5
+        to_remove = [k for k in self.annual_vacations.keys() if k not in self.worker_names]
+        for k in to_remove:
+            del self.annual_vacations[k]
+        self.save_annual_vacations()
+
+        self.monthly_schedules.clear()
+        self.save_all_schedules()
+        self.manual_edited_cells.clear()
+        self.display_initial_schedule_table()
+        self.save_worker_names()
+        self.load_worker_categories()
+        self.save_worker_categories()
+
+    def worker_management_dialog(self):
+        dialog = tk.Toplevel(self.root); dialog.title("근무자 명단 및 순서 관리"); dialog.geometry("700x500")
+        dialog.transient(self.root); dialog.grab_set()
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dialog.winfo_width() // 2)
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f'+{x}+{y}')
+
+        tk.Label(dialog, text="근무자 목록 (직책/구분 셀 더블 클릭하여 수정)", font=('Malgun Gothic', 14, 'bold')).pack(pady=10)
+
+        main_frame = ttk.Frame(dialog); main_frame.pack(padx=10, pady=5, fill='both', expand=True)
+
+        worker_tree = ttk.Treeview(main_frame, columns=['Name', 'Category'], show='headings', selectmode='browse')
+        worker_tree.heading('Name', text='근무자 이름')
+        worker_tree.column('Name', anchor='center', width=200, stretch=tk.NO)
+        worker_tree.heading('Category', text='직책/구분')
+        worker_tree.column('Category', anchor='center', width=150, stretch=tk.NO)
+
+        def refresh_worker_tree(tree, workers):
+            tree.delete(*tree.get_children())
+            for name in workers:
+                category = self.worker_categories_map.get(name, DEFAULT_CATEGORY)
+                tree.insert('', 'end', values=(name, category), tags=(name,))
+
+        refresh_worker_tree(worker_tree, self.worker_names)
+        worker_tree.pack(side='left', fill='both', expand=True)
+
+        def start_category_edit(event):
+            try:
+                if hasattr(dialog, 'editor_widget') and dialog.editor_widget.winfo_exists():
+                    dialog.editor_widget.destroy()
+
+                region = worker_tree.identify_region(event.x, event.y)
+                if region != "cell": return
+
+                column_id = worker_tree.identify_column(event.x)
+                item_id = worker_tree.identify_row(event.y)
+
+                if column_id != '#2': return
+
+                worker_name = worker_tree.item(item_id, 'values')[0]
+
+                bbox = worker_tree.bbox(item_id, column_id)
+                if not bbox: return
+                x, y, width, height = bbox
+
+                combobox = ttk.Combobox(worker_tree, values=WORKER_CATEGORIES, width=width, font=('Malgun Gothic', 10), state='readonly')
+
+                current_category = self.worker_categories_map.get(worker_name, DEFAULT_CATEGORY)
+                combobox.set(current_category)
+
+                combobox.place(x=x, y=y, width=width, height=height)
+
+                def update_category(e):
+                    new_category = combobox.get()
+                    worker_tree.set(item_id, 'Category', new_category)
+                    self.worker_categories_map[worker_name] = new_category
+                    self.save_worker_categories()
+                    combobox.destroy()
+
+                combobox.bind("<<ComboboxSelected>>", update_category)
+                combobox.bind("<Return>", update_category)
+                combobox.bind("<FocusOut>", lambda e: combobox.destroy() if e.widget == combobox else None)
+                combobox.focus_set();
+                dialog.editor_widget = combobox
+
+            except Exception as e:
+                logging.error(f"[start_category_edit] {e}")
+
+        worker_tree.bind("<Double-1>", start_category_edit)
+
+        reorder_button_frame = ttk.Frame(main_frame); reorder_button_frame.pack(side='right', padx=(5, 0))
+
+        def move_worker(direction):
+            try:
+                selected_item = worker_tree.selection()[0]
+                current_name = worker_tree.item(selected_item, 'values')[0]
+                current_index = self.worker_names.index(current_name)
+            except (IndexError, ValueError):
+                messagebox.showwarning("경고", "먼저 순서를 바꿀 근무자를 선택해 주세요.", parent=dialog)
+                return
+
+            target_index = current_index + direction
+
+            if 0 <= target_index < len(self.worker_names):
+                self.worker_names.insert(target_index, self.worker_names.pop(current_index))
+                refresh_worker_tree(worker_tree, self.worker_names)
+                for item_id in worker_tree.get_children():
+                    if worker_tree.item(item_id, 'values')[0] == current_name:
+                        worker_tree.selection_set(item_id)
+                        break
+            else:
+                messagebox.showwarning("경고", "더 이상 이동할 수 없습니다.", parent=dialog)
+
+        ttk.Button(reorder_button_frame, text="🔼 위로 이동", command=lambda: move_worker(-1), style='Small.TButton').pack(pady=5, fill='x')
+        ttk.Button(reorder_button_frame, text="🔽 아래로 이동", command=lambda: move_worker(1), style='Small.TButton').pack(pady=5, fill='x')
+
+        crud_frame = ttk.Frame(dialog); crud_frame.pack(pady=10)
+
+        def _add_worker_in_dialog():
+            new_name = simpledialog.askstring("근무자 추가", "추가할 근무자의 이름을 입력하세요:", parent=dialog)
+            if new_name and new_name.strip():
+                fixed_name = new_name.strip()
+                if fixed_name not in self.worker_names:
+                    self.worker_names.append(fixed_name)
+                    self.worker_categories_map[fixed_name] = DEFAULT_CATEGORY
+                    # 신규 근무자 연차 기본값 부여
+                    self.annual_vacations[fixed_name] = 21.5
+                    self.save_annual_vacations()
+                    self.save_worker_categories()
+                    refresh_worker_tree(worker_tree, self.worker_names)
+                    messagebox.showinfo("성공", f"근무자 '{fixed_name}'이(가) 추가되었습니다.", parent=dialog)
+                else:
+                    messagebox.showwarning("중복", f"이미 존재하는 근무자입니다: '{fixed_name}'", parent=dialog)
+
+        def _modify_worker_in_dialog():
+            try:
+                selected_item = worker_tree.selection()[0]
+                old_name = worker_tree.item(selected_item, 'values')[0]
+            except IndexError:
+                messagebox.showwarning("경고", "먼저 수정할 근무자를 선택해 주세요.", parent=dialog); return
+
+            new_name = simpledialog.askstring("새 이름 입력", f"'{old_name}'의 새로운 이름을 입력하세요:", parent=dialog)
+            if new_name and new_name.strip() and new_name.strip() != old_name:
+                fixed_new_name = new_name.strip()
+                if fixed_new_name in self.worker_names:
+                    messagebox.showwarning("중복", f"이미 존재하는 근무자 이름입니다: '{fixed_new_name}'", parent=dialog)
+                    return
+
+                self.worker_names[self.worker_names.index(old_name)] = fixed_new_name
+
+                # 카테고리 맵 키 업데이트
+                if old_name in self.worker_categories_map:
+                    category = self.worker_categories_map.pop(old_name)
+                    self.worker_categories_map[fixed_new_name] = category
+                    self.save_worker_categories()
+
+                # 연차 맵 키 업데이트
+                if old_name in self.annual_vacations:
+                    vac = self.annual_vacations.pop(old_name)
+                    self.annual_vacations[fixed_new_name] = vac
+                    self.save_annual_vacations()
+
+                refresh_worker_tree(worker_tree, self.worker_names)
+                for item_id in worker_tree.get_children():
+                    if worker_tree.item(item_id, 'values')[0] == fixed_new_name:
+                        worker_tree.selection_set(item_id)
+                        break
+
+                messagebox.showinfo("성공", f"'{old_name}'이(가) '{fixed_new_name}'(으)로 수정되었습니다.", parent=dialog)
+
+        def _delete_worker_in_dialog():
+            try:
+                selected_item = worker_tree.selection()[0]
+                name_to_delete = worker_tree.item(selected_item, 'values')[0]
+            except IndexError:
+                messagebox.showwarning("경고", "먼저 삭제할 근무자를 선택해 주세요.", parent=dialog); return
+
+            if messagebox.askyesno("삭제 확인", f"근무자 '{name_to_delete}'을(를) 정말 삭제하시겠습니까?", parent=dialog):
+                self.worker_names.remove(name_to_delete)
+                if name_to_delete in self.worker_categories_map:
+                    del self.worker_categories_map[name_to_delete]
+                    self.save_worker_categories()
+                if name_to_delete in self.annual_vacations:
+                    del self.annual_vacations[name_to_delete]
+                    self.save_annual_vacations()
+
+                refresh_worker_tree(worker_tree, self.worker_names)
+                messagebox.showinfo("성공", f"근무자 '{name_to_delete}'이(가) 명단에서 삭제되었습니다.", parent=dialog)
+
+        ttk.Button(crud_frame, text="➕ 근무자 추가", command=_add_worker_in_dialog, style='Small.TButton').pack(side='left', padx=5)
+        ttk.Button(crud_frame, text="📝 선택 근무자 수정", command=_modify_worker_in_dialog, style='Small.TButton').pack(side='left', padx=5)
+        ttk.Button(crud_frame, text="🗑️ 선택 근무자 삭제", command=_delete_worker_in_dialog, style='Small.TButton').pack(side='left', padx=5)
+
+        # 하단 적용/닫기 버튼
+        def on_ok():
+            self.save_worker_categories()
+            self.update_gui_after_worker_change()
+            dialog.destroy()
+            messagebox.showinfo("적용 완료", "변경된 근무자 명단 및 순서가 메인 화면에 적용되었습니다.")
+
+        button_frame_bottom = ttk.Frame(dialog); button_frame_bottom.pack(side='bottom', pady=10)
+        ttk.Button(button_frame_bottom, text="확인 및 적용", command=on_ok, style='Dialog.Primary.TButton').pack(side='left', padx=10)
+        ttk.Button(button_frame_bottom, text="닫기", command=dialog.destroy, style='Dialog.Secondary.TButton').pack(side='left', padx=10)
+
+        self.root.wait_window(dialog)
+
+    def start_worker_name_edit(self, event):
+        tree = self.current_tree
+        try:
+            region = tree.identify_region(event.x, event.y)
+            if region != "heading":
+                column_id = tree.identify_column(event.x)
+                item_id = tree.identify_row(event.y)
+            else:
+                return
+
+            if column_id != '#1': return
+
+            old_name = tree.item(item_id, 'values')[0]
+
+            new_name = simpledialog.askstring(
+                "근무자 이름 수정",
+                f"'{old_name}'의 새로운 이름을 입력하세요:",
+                parent=self.root
+            )
+
+            if new_name and new_name.strip() and new_name.strip() != old_name:
+                fixed_new_name = new_name.strip()
+                if fixed_new_name in self.worker_names:
+                    messagebox.showwarning("중복", f"이미 존재하는 근무자 이름입니다: '{fixed_new_name}'")
+                    return
+
+                old_index = self.worker_names.index(old_name)
+                self.worker_names[old_index] = fixed_new_name
+                self.save_worker_names()
+
+                # worker_categories_map 업데이트
+                if old_name in self.worker_categories_map:
+                    category = self.worker_categories_map.pop(old_name)
+                    self.worker_categories_map[fixed_new_name] = category
+                    self.save_worker_categories()
+
+                # DataFrame Index 업데이트
+                if not self.current_schedule_df.empty:
+                    self.current_schedule_df = self.current_schedule_df.rename(index={old_name: fixed_new_name})
+                    year, month = self.year_var.get(), self.month_var.get()
+                    self.save_current_schedule_to_memory(self.current_schedule_df, year, month)
+
+                # 이전 달 근무 기록 업데이트
+                if old_name in self.prev_month_last_day_duties:
+                    duty = self.prev_month_last_day_duties.pop(old_name)
+                    self.prev_month_last_day_duties[fixed_new_name] = duty
+
+                # 연차 맵 키 업데이트
+                if old_name in self.annual_vacations:
+                    vac = self.annual_vacations.pop(old_name)
+                    self.annual_vacations[fixed_new_name] = vac
+                    self.save_annual_vacations()
+
+                # UI 새로고침
+                self.display_initial_schedule_table()
+                messagebox.showinfo("성공", f"'{old_name}'이(가) '{fixed_new_name}'(으)로 수정되었습니다.")
+
+        except IndexError:
+            pass
+        except Exception as e:
+            logging.error(f"[start_worker_name_edit] {e}")
+            messagebox.showerror("오류", f"근무자 이름 수정 중 오류가 발생했습니다.\n오류: {e}")
+
+    # ------------------------------------------------------------------
+    # [근무표/통계 및 UI 표시]
+    # ------------------------------------------------------------------
+    def _get_previous_duty(self, worker_name, day_index, day_offset, schedule_data):
+        if day_index >= day_offset:
+            return schedule_data[worker_name][day_index - day_offset]
+        prev_duties = self.prev_month_last_day_duties.get(worker_name, [])
+        prev_index = len(prev_duties) - day_offset + day_index
+        if 0 <= prev_index < len(prev_duties):
+            return prev_duties[prev_index]
+        return ''
+
+    def get_month_days(self, year, month):
+        year, month = int(year), int(month)
+        try:
+            _, last_day = calendar.monthrange(year, month)
+        except ValueError:
+            last_day = 30
+        weekday_names_kr = ["월", "화", "수", "목", "금", "토", "일"]
+        day_columns = []
+        for day in range(1, last_day + 1):
+            try:
+                date_obj = datetime.date(year, month, day)
+                weekday = weekday_names_kr[date_obj.weekday()]
+                day_columns.append(f"{month}/{day} ({weekday})")
+            except:
+                day_columns.append(f"{month}/{day} (?)")
+        return year, month, last_day, day_columns
+
+    def display_schedule_table(self, df, year, month):
+        for widget in self.schedule_frame.winfo_children(): widget.destroy()
+        if df.empty:
+            tk.Label(self.schedule_frame, text="근무표 데이터가 없습니다.", font=('Malgun Gothic', 14)).pack(pady=20); return
+
+        style = ttk.Style()
+        style.configure("Custom.Treeview.Heading", background="white", foreground="#A9A9A9", font=('Malgun Gothic', 10, 'bold'))
+        style.configure("Treeview", rowheight=25)
+        style.configure("N.cell", foreground="#FF0000", font=('Malgun Gothic', 10, 'bold'))
+        style.configure("Weekend.bg", background="#FFFBE0")
+
+        tree_frame = ttk.Frame(self.schedule_frame); tree_frame.pack(fill='both', expand=True)
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL); tree_scroll_y.pack(side='right', fill='y')
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL); tree_scroll_x.pack(side='bottom', fill='x')
+
+        columns = ["근무자"] + list(df.columns)
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings',
+                            yscrollcommand=tree_scroll_y.set,
+                            xscrollcommand=tree_scroll_x.set)
+
+        def remove_editor_widget(*args):
+            if hasattr(tree, 'editor_widget') and tree.editor_widget.winfo_exists():
+                tree.editor_widget.destroy()
+
+        tree_scroll_y.config(command=lambda *args: (remove_editor_widget(), tree.yview(*args)))
+        tree_scroll_x.config(command=lambda *args: (remove_editor_widget(), tree.xview(*args)))
+        tree.bind("<MouseWheel>", lambda e: (remove_editor_widget(), tree.yview_scroll(int(-1*(e.delta/120)), "units")))
+
+        for col in df.columns:
+            day_and_weekday = col.split('/', 1)[-1].strip()
+            tree.heading(col, text=day_and_weekday, anchor='center'); tree.column(col, width=60, anchor='center', stretch=tk.NO)
+        tree.heading("근무자", text="근무자", anchor='center'); tree.column("근무자", width=100, anchor='center', stretch=tk.NO)
+
+        for worker_index, (worker, row) in enumerate(df.iterrows()):
+            item_id = tree.insert('', 'end', values=[worker] + row.tolist(), tags=(worker,))
+            for col_index, duty in enumerate(row):
+                col_name = df.columns[col_index]
+                weekday = col_name.split('(')[-1].replace(')', '')
+                tags_to_apply = []
+                if weekday in ['토', '일']:
+                    tags_to_apply.append('Weekend.bg')
+                if duty == 'N':
+                    tags_to_apply.append('N.cell')
+                for tag in tags_to_apply:
+                    current_tags = tree.item(item_id, 'tags')
+                    if tag not in current_tags:
+                        tree.item(item_id, tags=current_tags + (tag,))
+
+        tree.pack(fill='both', expand=True)
+
+        tree.bind("<Button-1>", self.start_schedule_edit)
+        tree.bind("<Double-1>", self.start_worker_name_edit)
+
+        self.month_label_text.set(f"🗓️ {year}년 {month}월 근무표")
+        self.current_tree = tree
+
+    def display_summary_table(self, summary_df):
+        for widget in self.summary_frame.winfo_children(): widget.destroy()
+        if summary_df.empty:
+            tk.Label(self.summary_frame, text="근무표 생성 후\n통계가 표시됩니다.", font=('Malgun Gothic', 12), bg='white').pack(pady=100, padx=50); return
+        ttk.Style().configure("Summary.Treeview.Heading", background="#E8F0FE", foreground="#333333", font=('Malgun Gothic', 9, 'bold'))
+        tk.Label(self.summary_frame, text="근무 합산 통계", font=('Malgun Gothic', 12, 'bold'), bg='white').pack(pady=(0, 5))
+        tree_frame = ttk.Frame(self.summary_frame); tree_frame.pack(fill='both', expand=True)
+        columns = list(summary_df.columns)
+        tree = ttk.Treeview(tree_frame, columns=columns, show='headings', style="Summary.Treeview")
+        column_widths = {'근무자': 80, '직책/구분': 70, '전월 연차': 60, '총 연차': 60, '총 근무': 60, 'D': 40, 'E': 40, 'MD': 40, 'N': 40, 'DH': 40, 'Off': 40, 'V': 40, 'v.25': 40, 'v.0.5': 40, '주말_근무': 60}
+        for col in columns:
+            tree.heading(col, text=col.replace('_', ' '), anchor='center')
+            tree.column(col, width=column_widths.get(col, 50), anchor='center', stretch=tk.NO)
+        for index, row in summary_df.iterrows(): tree.insert('', 'end', values=row.tolist())
+        tree.pack(fill='both', expand=True)
+
+    def display_initial_schedule_table(self):
+        try:
+            selected_year, selected_month = self.year_var.get(), self.month_var.get()
+        except:
+            return
+        if not self.worker_names:
+            for widget in self.schedule_frame.winfo_children(): widget.destroy()
+            tk.Label(self.schedule_frame, text="근무자 관리 메뉴에서 근무자를 먼저 추가해 주세요.", font=('Malgun Gothic', 14)).pack(pady=100)
+            self.month_label_text.set(f"🗓️ {selected_year}년 {selected_month}월 근무표")
+            return
+
+        loaded_df, loaded_manual_edits = self.load_schedule_from_memory(selected_year, selected_month)
+        year, month, last_day, day_columns = self.get_month_days(selected_year, selected_month)
+
+        if loaded_df is not None and not loaded_df.empty:
+            self.current_schedule_df = loaded_df
+            self.manual_edited_cells = loaded_manual_edits
+            if list(self.current_schedule_df.index) != self.worker_names:
+                loaded_df = None
+                self.current_schedule_df = pd.DataFrame()
+                self.manual_edited_cells.clear()
+
+        if loaded_df is None:
+            self.manual_edited_cells.clear()
+            initial_data = {name: [''] * len(day_columns) for name in self.worker_names}
+            df_initial = pd.DataFrame(initial_data).transpose(); df_initial.columns = day_columns
+            self.current_schedule_df = df_initial
+
+        self.display_schedule_table(self.current_schedule_df, year, month)
+
+        if not self.current_schedule_df.empty and loaded_df is not None:
+            self.current_summary_df = self.generate_schedule_summary(self.current_schedule_df, selected_year, selected_month)
+        else:
+            self.current_summary_df = pd.DataFrame()
+
+        self.display_summary_table(self.current_summary_df)
+
+    def go_to_current_month(self):
+        now = datetime.datetime.now()
+        self.year_var.set(now.year)
+        self.month_var.set(now.month)
+        messagebox.showinfo("이동 완료", f"현재 날짜인 {now.year}년 {now.month}월로 이동했습니다.")
+
+    def load_and_display_data_after_startup(self):
+        self.load_all_schedules()
+        self.display_initial_schedule_table()
+
+    def generate_schedule_summary(self, df_schedule, year, month):
+        if df_schedule.empty: return pd.DataFrame()
+
+        DUTY_TYPES = ['D', 'E', 'N', 'MD', 'DH', 'Off', 'V', 'v.25', 'v.0.5']
+        summary_df = df_schedule.stack().groupby(level=0).value_counts().unstack(fill_value=0)
+        summary_df['Off'] = summary_df.get('O', 0) + summary_df.get('Off', 0)
+        summary_df = summary_df.drop(columns=['O'], errors='ignore')
+
+        for col in DUTY_TYPES:
+            if col not in summary_df.columns: summary_df[col] = 0
+
+        summary_df = summary_df.reset_index(names=['근무자'])
+        summary_df['직책/구분'] = summary_df['근무자'].apply(lambda name: self.worker_categories_map.get(name, DEFAULT_CATEGORY))
+
+        weekend_cols = [col for col in df_schedule.columns if '(토)' in col or '(일)' in col]
+        if weekend_cols:
+            summary_df['주말_근무'] = df_schedule[weekend_cols].apply(lambda row: row.astype(str).str.contains('|'.join(WORK_DUTIES)).sum(), axis=1).values
+        else:
+            summary_df['주말_근무'] = 0
+
+        summary_df['총 근무'] = summary_df[['D', 'E', 'MD', 'N', 'DH']].sum(axis=1)
+        summary_df['전월 연차'] = 2.0
+
+        # 🔵 NEW: '총 연차' 계산 (파일에 저장된 연차 - 사용 연차)
+        def remaining_vac(name):
+            base = self.annual_vacations.get(name, 21.5)
+            # 안전하게 컬럼 존재 및 단일값 추출
+            v_cnt = int(summary_df.loc[summary_df['근무자'] == name, 'V'].values[0]) if 'V' in summary_df.columns else 0
+            v25_cnt = int(summary_df.loc[summary_df['근무자'] == name, 'v.25'].values[0]) if 'v.25' in summary_df.columns else 0
+            v05_cnt = int(summary_df.loc[summary_df['근무자'] == name, 'v.0.5'].values[0]) if 'v.0.5' in summary_df.columns else 0
+            used = v_cnt + v25_cnt * 0.25 + v05_cnt * 0.5
+            return round(base - used, 2)
+
+        summary_df['총 연차'] = summary_df['근무자'].apply(remaining_vac)
+
+        final_cols = ['근무자', '직책/구분', '전월 연차', '총 연차', '총 근무', 'D', 'E', 'DH', 'MD', 'N', 'Off', 'V', 'v.25', 'v.0.5', '주말_근무']
+        return summary_df.reindex(columns=final_cols)
+
+    def update_schedule_cell(self, event, tree, combobox, item_id, column_id, col_name, worker_name):
+        """Combobox 선택 후 Treeview와 DataFrame을 업데이트, 수동 편집 추적 및 연차 차감 처리"""
+        new_value = combobox.get()
+        col_name_df = tree.heading(column_id)['text']
+        if col_name_df == '근무자': return
+
+        edit_key = (worker_name, col_name)
+
+        if new_value != '':
+            self.manual_edited_cells.add(edit_key)
+        else:
+            if edit_key in self.manual_edited_cells:
+                self.manual_edited_cells.remove(edit_key)
+
+        # 이전 값(변경 전 셀 값)을 안전하게 얻기
+        old_value = ''
+        if not self.current_schedule_df.empty and worker_name in self.current_schedule_df.index and col_name in self.current_schedule_df.columns:
+            old_value = str(self.current_schedule_df.loc[worker_name, col_name])
+
+        # 트리뷰와 데이터프레임 업데이트
+        tree.set(item_id, column_id, new_value)
+
+        if not self.current_schedule_df.empty and worker_name in self.current_schedule_df.index and col_name in self.current_schedule_df.columns:
+            # 연차 사용량 변화 계산 (새로운 값 - 이전 값)
+            def used_amount(val):
+                if val == 'V': return 1.0
+                if val == 'v.25': return 0.25
+                if val == 'v.0.5': return 0.5
+                return 0.0
+
+            old_used = used_amount(old_value)
+            new_used = used_amount(new_value)
+            delta = new_used - old_used  # 양수면 더 사용한 것(차감), 음수면 환원
+
+            # 데이터프레임에 값 적용
+            self.current_schedule_df.loc[worker_name, col_name] = new_value
+
+            # 연차 차감/환원 적용
+            if delta != 0:
+                # 해당 근무자의 남은 연차가 없으면 0 이하로 내려가지 않도록 처리(단, 환원은 허용)
+                prev_remaining = self.annual_vacations.get(worker_name, 21.5)
+                new_remaining = prev_remaining - delta
+                # 음수 방지: 만약 차감으로 인해 음수가 되면 0으로 제한
+                if new_remaining < 0:
+                    new_remaining = 0.0
+                # 반올림(소수 둘째자리)
+                self.annual_vacations[worker_name] = round(new_remaining, 2)
+                self.save_annual_vacations()
+
+            year, month = self.year_var.get(), self.month_var.get()
+            self.save_current_schedule_to_memory(self.current_schedule_df, year, month)
+
+            if col_name in self.current_schedule_df.columns[-5:]:
+                self.save_prev_month_schedule()
+
+            if self.summary_frame:
+                self.current_summary_df = self.generate_schedule_summary(self.current_schedule_df, year, month)
+                self.display_summary_table(self.current_summary_df)
+
+        combobox.destroy()
+        # 태그 갱신을 위해 재표시
+        self.display_schedule_table(self.current_schedule_df, self.year_var.get(), self.month_var.get())
+
+    def start_schedule_edit(self, event):
+        tree = self.current_tree
+        try:
+            if hasattr(tree, 'editor_widget') and tree.editor_widget.winfo_exists():
+                tree.editor_widget.destroy()
+
+            region = tree.identify_region(event.x, event.y)
+            if region != "cell": return
+
+            column_id = tree.identify_column(event.x)
+            item_id = tree.identify_row(event.y)
+
+            if column_id == '#1': return
+
+            col_index = int(column_id.replace('#', '')) - 2
+            worker_name = tree.item(item_id, 'values')[0]
+
+            col_name_full = self.current_schedule_df.columns[col_index]
+            current_value = tree.set(item_id, column_id)
+            bbox = tree.bbox(item_id, column_id)
+            if not bbox: return
+            x, y, width, height = bbox
+
+            combobox = ttk.Combobox(tree, values=EDITABLE_SHIFTS, width=width, font=('Malgun Gothic', 10), state='readonly')
+            combobox.set(current_value)
+            combobox.place(x=x, y=y, width=width, height=height)
+            combobox.bind("<<ComboboxSelected>>", lambda e: self.update_schedule_cell(e, tree, combobox, item_id, column_id, col_name_full, worker_name))
+            combobox.bind("<FocusOut>", lambda e: combobox.destroy() if e.widget == combobox and not combobox.winfo_ismapped() else None)
+            combobox.bind("<Return>", lambda e: self.update_schedule_cell(e, tree, combobox, item_id, column_id, col_name_full, worker_name))
+            combobox.focus_set();
+            tree.editor_widget = combobox
+        except Exception as e: logging.error(f"[start_schedule_edit] {e}")
+
+    def generate_monthly_schedule(self, year, month):
+        year, month, last_day, day_columns = self.get_month_days(year, month);
+        if not self.worker_names: return pd.DataFrame(), year, month
+
+        schedule_data = {name: [''] * last_day for name in self.worker_names}
+        hn_name = self.worker_names[0] if self.worker_names else None
+        start_date = datetime.date(year, month, 1)
+
+        if not self.current_schedule_df.empty:
+            df_temp = self.current_schedule_df.copy().fillna('').astype(str)
+            for worker in self.worker_names:
+                for day_index, col_name in enumerate(day_columns):
+                    edit_key = (worker, col_name)
+                    if edit_key in self.manual_edited_cells and worker in df_temp.index and col_name in df_temp.columns:
+                        manual_value = df_temp.loc[worker, col_name]
+                        schedule_data[worker][day_index] = manual_value
+
+        daily_n_usage = [0] * last_day
+        duty_counts = {name: {d: 0 for d in WORK_DUTIES} for name in self.worker_names}
+
+        for name in self.worker_names:
+            for day_index in range(last_day):
+                duty = schedule_data[name][day_index]
+                if duty == 'N':
+                    daily_n_usage[day_index] += 1
+                if duty in WORK_DUTIES:
+                    duty_counts[name][duty] += 1
+
+        if self.is_head_nurse_mode.get() and hn_name and hn_name in schedule_data and self.worker_categories_map.get(hn_name) == '수선생님':
+            for day_index in range(last_day):
+                if schedule_data[hn_name][day_index] == '':
+                    weekday = (start_date + datetime.timedelta(days=day_index)).weekday()
+                    assigned_duty = 'D' if 0 <= weekday <= 4 else 'O'
+                    schedule_data[hn_name][day_index] = assigned_duty
+                    if assigned_duty == 'D':
+                        duty_counts[hn_name]['D'] += 1
+
+        workers_for_n = [w for w in self.worker_names if self.worker_categories_map.get(w) != '수선생님']
+        random.shuffle(workers_for_n)
+        n_set_counts = {name: 0 for name in workers_for_n}
+        prev_month_duties = self.prev_month_last_day_duties
+
+        N_PATTERN = ['N', 'N', 'N', 'O', 'O']
+
+        for name in workers_for_n:
+            last_5 = prev_month_duties.get(name, [])
+            if not last_5: continue
+
+            n_count = 0
+            for d in reversed(last_5):
+                if d == 'N': n_count += 1
+                else: break
+
+            duties_to_continue = []
+            if 1 <= n_count <= 3:
+                duties_to_continue = N_PATTERN[n_count:]
+            elif len(last_5) >= 4 and last_5[-1] == 'O' and last_5[-2] == 'N' and last_5[-3] == 'N' and last_5[-4] == 'N':
+                duties_to_continue = ['O']
+
+            for day_idx, duty in enumerate(duties_to_continue):
+                if day_idx >= last_day: break
+                existing_duty = schedule_data[name][day_idx]
+                if existing_duty != '':
+                    if existing_duty == duty:
+                        continue
+                    else:
+                        break
+                schedule_data[name][day_idx] = duty
+                if duty == 'N':
+                    daily_n_usage[day_idx] += 1
+                    duty_counts[name]['N'] += 1
+
+        for start_day in range(last_day):
+            if daily_n_usage[start_day] >= DAILY_LIMITS['N'] * 2 or (last_day - start_day) < 3:
+                continue
+
+            n_len = 3
+            o_start_day = start_day + n_len
+            o_len = min(2, last_day - o_start_day)
+            block_len = n_len + o_len
+
+            available_workers = [
+                worker for worker in workers_for_n
+                if n_set_counts[worker] < 2 and
+                all(schedule_data[worker][d] == '' for d in range(start_day, start_day + block_len)) and
+                daily_n_usage[start_day] < DAILY_LIMITS['N'] and
+                (start_day + 1 >= last_day or daily_n_usage[start_day+1] < DAILY_LIMITS['N']) and
+                (start_day + 2 >= last_day or daily_n_usage[start_day+2] < DAILY_LIMITS['N'])
+            ]
+
+            if not available_workers: continue
+
+            worker_to_assign = min(available_workers, key=lambda w: n_set_counts[w])
+
+            for d in range(start_day, start_day + n_len):
+                if d < last_day:
+                    schedule_data[worker_to_assign][d] = 'N'
+                    daily_n_usage[d] += 1
+                    duty_counts[worker_to_assign]['N'] += 1
+
+            for d in range(o_start_day, o_start_day + o_len):
+                if d < last_day:
+                    schedule_data[worker_to_assign][d] = 'O'
+
+            n_set_counts[worker_to_assign] += 1
+
+        last_day_index = last_day - 1
+        n_on_last_day = any(schedule_data[name][last_day_index] == 'N' for name in workers_for_n)
+
+        if not n_on_last_day and daily_n_usage[last_day_index] < DAILY_LIMITS['N']:
+            eligible_workers = [name for name in workers_for_n if schedule_data[name][last_day_index] == '']
+            if eligible_workers:
+                worker_to_assign = min(eligible_workers, key=lambda w: n_set_counts.get(w, 0))
+                schedule_data[worker_to_assign][last_day_index] = 'N'
+                daily_n_usage[last_day_index] += 1
+                duty_counts[worker_to_assign]['N'] += 1
+
+        num_workers_for_duty = len(self.worker_names) - (1 if self.is_head_nurse_mode.get() and hn_name else 0)
+        num_work_days = sum(1 for col_str in day_columns if col_str[-2] not in ['토', '일'])
+        duties_for_auto_allocation = ['D', 'E', 'N']
+        target_duty_count_per_worker = max(1, math.ceil(num_work_days * len(duties_for_auto_allocation) / num_workers_for_duty)) if num_workers_for_duty > 0 else 0
+
+        DAILY_ASSIGNABLE_DUTIES = ['D', 'E']
+
+        for day_index in range(last_day):
+            date_obj = start_date + datetime.timedelta(days=day_index)
+            weekday = date_obj.weekday()
+            current_daily_limits = DAILY_LIMITS.copy()
+            if weekday >= 5: current_daily_limits['E'] = 1
+
+            daily_duty_counts = {'D': 0, 'E': 0, 'N': 0, 'DH': 0}
+
+            workers_to_schedule = []
+
+            for name in self.worker_names:
+                current_duty = schedule_data[name][day_index]
+                if current_duty in WORK_DUTIES:
+                    daily_duty_counts[current_duty] += 1
+                elif current_duty == '':
+                    workers_to_schedule.append(name)
+
+            if self.is_head_nurse_mode.get() and hn_name and hn_name in workers_to_schedule and self.worker_categories_map.get(hn_name) == '수선생님':
+                workers_to_schedule.remove(hn_name)
+
+            random.shuffle(workers_to_schedule)
+
+            for name in workers_to_schedule:
+                assigned_duty = ''
+
+                prev_duty = self._get_previous_duty(name, day_index, 1, schedule_data)
+                prev_2_duty = self._get_previous_duty(name, day_index, 2, schedule_data)
+                prev_3_duty = self._get_previous_duty(name, day_index, 3, schedule_data)
+                prev_4_duty = self._get_previous_duty(name, day_index, 4, schedule_data)
+
+                if prev_duty == 'N': assigned_duty = 'O'
+                elif prev_duty == 'O':
+                    if prev_2_duty == 'N' and prev_3_duty == 'N' and prev_4_duty == 'N':
+                        assigned_duty = 'O'
+                elif day_index >= 5:
+                    last_5 = schedule_data[name][day_index-5:day_index]
+                    if len(last_5) == 5 and all(d in WORK_DUTIES for d in last_5):
+                        assigned_duty = 'O'
+
+                if not assigned_duty:
+                    target_rotation = ''
+                    forbidden_duties = set()
+
+                    if prev_duty == 'E': forbidden_duties.add('D'); target_rotation = 'E'
+                    if prev_2_duty == 'N' and prev_duty == 'O': forbidden_duties.add('D')
+
+                    if not target_rotation:
+                        if prev_duty == 'D': target_rotation = 'E'
+                        else: target_rotation = sorted(DAILY_ASSIGNABLE_DUTIES, key=lambda d: duty_counts[name].get(d, 0))[0]
+
+                    if target_rotation not in DAILY_ASSIGNABLE_DUTIES:
+                        target_rotation = sorted(DAILY_ASSIGNABLE_DUTIES, key=lambda d: duty_counts[name].get(d, 0))[0]
+
+                    duties_to_check = [target_rotation] + [d for d in DAILY_ASSIGNABLE_DUTIES if d != target_rotation]
+
+                    for duty_to_check in duties_to_check:
+                        if duty_to_check in forbidden_duties: continue
+                        is_daily_full = daily_duty_counts.get(duty_to_check, 0) >= current_daily_limits.get(duty_to_check, float('inf'))
+                        if duty_to_check in ['D', 'E', 'N']:
+                            is_worker_full = duty_counts[name][duty_to_check] >= target_duty_count_per_worker + 1
+                        else:
+                            is_worker_full = False
+
+                        if not is_daily_full and not is_worker_full:
+                            assigned_duty = duty_to_check
+                            break
+
+                    if not assigned_duty: assigned_duty = 'O'
+
+                schedule_data[name][day_index] = assigned_duty
+
+                if assigned_duty in WORK_DUTIES:
+                    duty_counts[name][assigned_duty] += 1
+                    daily_duty_counts[assigned_duty] += 1
+
+        df = pd.DataFrame({name: schedule_data[name] for name in self.worker_names}).transpose(); df.columns = day_columns
+        return df, year, month
+
+    def generate_and_display(self):
+        if not self.worker_names:
+            messagebox.showwarning("경고", "근무자가 최소 1명 이상 등록되어야 합니다."); return
+        try:
+            selected_year, selected_month = self.year_var.get(), self.month_var.get()
+        except tk.TclError:
+            messagebox.showerror("오류", "올바른 년도와 월을 선택해 주세요."); return
+
+        self.load_prev_month_schedule()
+
+        df_schedule, year, month = self.generate_monthly_schedule(selected_year, selected_month)
+
+        self.save_current_schedule_to_memory(df_schedule, year, month)
+
+        self.display_schedule_table(df_schedule, year, month)
+        summary_df = self.generate_schedule_summary(df_schedule, year, month)
+        self.display_summary_table(summary_df)
+
+        self.current_schedule_df = df_schedule
+        self.current_summary_df = summary_df
+
+        self.save_prev_month_schedule()
+
+    def clear_schedule(self):
+        if not self.worker_names: messagebox.showwarning("경고", "초기화할 근무자 명단이 없습니다."); return
+        try:
+            year, month = self.year_var.get(), self.month_var.get()
+            if not messagebox.askyesno("확인", f"{year}년 {month}월 근무표를 초기화하시겠습니까? (수동 편집 내용 포함)"): return
+
+            key = f"{year}-{month:02d}"
+            if key in self.monthly_schedules:
+                del self.monthly_schedules[key]
+                self.save_all_schedules()
+
+            self.manual_edited_cells.clear()
+            year, month, last_day, day_columns = self.get_month_days(year, month)
+            initial_data = {name: [''] * len(day_columns) for name in self.worker_names}
+            df_initial = pd.DataFrame(initial_data).transpose(); df_initial.columns = day_columns
+            self.current_schedule_df = df_initial
+            self.display_schedule_table(self.current_schedule_df, year, month)
+            self.current_summary_df = pd.DataFrame()
+            self.display_summary_table(self.current_summary_df)
+            self.save_prev_month_schedule()
+        except Exception as e:
+            messagebox.showerror("초기화 오류", f"근무표 초기화 중 오류가 발생했습니다: {e}")
+
+    # ------------------------------------------------------------------
+    # [메인 UI 및 이벤트 연결]
+    # ------------------------------------------------------------------
+    def show_popup_menu(self, menu_name, parent_button):
+        menu = tk.Menu(
+            self.root,
+            tearoff=0,
+            bg='white',
+            fg='#333333',
+            activebackground='#F0F0F0',
+            activeforeground=TOSS_BLUE,
+            relief='flat',
+            borderwidth=0,
+            font=('Malgun Gothic', 10)
+        )
+
+        if menu_name == '파일':
+            menu.add_command(label="종료", command=self.on_closing)
+
+        elif menu_name == '근무자 관리':
+            menu.add_command(label="명단 관리", command=self.worker_management_dialog)
+            # 🔵 NEW: 연차 입력 메뉴 추가
+            menu.add_command(label="연차 입력", command=self.annual_vacation_dialog)
+            menu.add_separator()
+
+            def toggle_head_nurse_mode_command():
+                if not self.worker_names:
+                    messagebox.showwarning("경고", "근무자 명단이 비어있습니다.")
+                    self.is_head_nurse_mode.set(False)
+                    return
+                hn_name = self.worker_names[0]
+                hn_category = self.worker_categories_map.get(hn_name)
+
+                if self.is_head_nurse_mode.get() and hn_category != '수선생님':
+                    messagebox.showwarning("경고", f"현재 1순위 근무자({hn_name})의 직책이 '수선생님'이 아닙니다. 직책을 먼저 설정해주세요.")
+                    self.is_head_nurse_mode.set(False)
+                    return
+
+                self.display_initial_schedule_table()
+                messagebox.showinfo("모드 변경", f"상위 근무자({hn_name}) 주간 근무 모드가 {'적용' if self.is_head_nurse_mode.get() else '해제'}되었습니다.")
+
+            menu.add_checkbutton(label="수선생님(1순위) 주간 근무 모드", onvalue=True, offvalue=False, variable=self.is_head_nurse_mode, command=toggle_head_nurse_mode_command)
+
+        elif menu_name == '데이터':
+            menu.add_command(label="Excel 데이터 저장 (.xlsx)", command=self.save_schedule_to_excel)
+
+        parent_button.update_idletasks()
+        x = parent_button.winfo_rootx()
+        y = parent_button.winfo_rooty() + parent_button.winfo_height() + 1
+
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def setup_main_window(self):
+        self.root.title("📅 근무표 생성 시스템"); self.root.configure(bg='white')
+
+        try: self.root.iconbitmap('favicon.ico')
+        except tk.TclError: pass
+
+        screen_width = self.root.winfo_screenwidth(); screen_height = self.root.winfo_screenheight()
+        x_cordinate = int((screen_width / 2) - (WINDOW_WIDTH / 2))
+        y_cordinate = int((screen_height / 2) - (WINDOW_HEIGHT / 2))
+        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x_cordinate}+{y_cordinate}")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        style = ttk.Style(); style.theme_use('default')
+        style.configure('Toss.TLabel', font=('Malgun Gothic', 16, 'bold'), background='white', foreground='#333333')
+        style.configure('Toss.TFrame', background='white')
+
+        style.configure('Primary.TButton', font=('Malgun Gothic', 14, 'bold'), foreground='white', background=TOSS_BLUE, padding=[30, 15], relief='flat')
+        style.map('Primary.TButton', background=[('active', '#004A99')], foreground=[('active', 'white')])
+
+        style.configure('Clear.TButton',
+            font=('Malgun Gothic', 14, 'bold'),
+            foreground='#333333',
+            background='white',
+            padding=[30, 15],
+            relief='solid',
+            borderwidth=2
+        )
+        style.map('Clear.TButton',
+            background=[('active', '#F0F0F0')],
+            foreground=[('active', '#333333')]
+        )
+
+        style.configure('Dialog.Primary.TButton', font=('Malgun Gothic', 11, 'bold'), foreground='white', background=TOSS_BLUE, padding=[15, 8], relief='flat')
+        style.map('Dialog.Primary.TButton', background=[('active', '#004A99')], foreground=[('active', 'white')])
+        style.configure('Dialog.Secondary.TButton', font=('Malgun Gothic', 11, 'bold'), foreground='#333333', background='#EFEFEF', padding=[15, 8], relief='flat')
+        style.map('Dialog.Secondary.TButton', background=[('active', '#DCDCDC')], foreground=[('active', '#333333')])
+
+        style.configure('Small.TButton', font=('Malgun Gothic', 12), padding=[10, 5], background='#F0F0F0', relief='flat')
+        style.map('Small.TButton', background=[('active', '#E0E0E0')], foreground=[('active', '#333333')])
+        style.configure('Menu.TButton', font=('Malgun Gothic', 10, 'bold'), foreground='#333333', background='white', padding=[10, 5], relief='flat')
+        style.map('Menu.TButton', background=[('active', '#F0F0F0')], foreground=[('active', TOSS_BLUE)])
+
+        top_bar_frame = ttk.Frame(self.root, style='Toss.TFrame'); top_bar_frame.pack(fill='x', padx=20, pady=(10, 0))
+
+        file_button = ttk.Button(top_bar_frame, text="파일", style='Menu.TButton')
+        file_button.config(command=lambda btn=file_button: self.show_popup_menu('파일', btn))
+        file_button.pack(side='left', padx=(0, 5))
+
+        worker_button = ttk.Button(top_bar_frame, text="근무자 관리", style='Menu.TButton')
+        worker_button.config(command=lambda btn=worker_button: self.show_popup_menu('근무자 관리', btn))
+        worker_button.pack(side='left', padx=5)
+
+        data_button = ttk.Button(top_bar_frame, text="데이터", style='Menu.TButton')
+        data_button.config(command=lambda btn=data_button: self.show_popup_menu('데이터', btn))
+        data_button.pack(side='left', padx=5)
+
+        control_frame = ttk.Frame(self.root, style='Toss.TFrame'); control_frame.pack(pady=(5, 5), padx=20)
+        ttk.Button(control_frame, text="◀◀ 이전 년도", command=lambda: self.year_var.set(self.year_var.get() - 1), style='Small.TButton').pack(side='left', padx=(0, 5))
+        ttk.Button(control_frame, text="◀ 이전 달", command=lambda: self.month_var.set(self.month_var.get() - 1), style='Small.TButton').pack(side='left', padx=(5, 10))
+        ttk.Button(control_frame, text="오늘", command=self.go_to_current_month, style='Small.TButton').pack(side='left', padx=(10, 10))
+        ttk.Button(control_frame, text="다음 달 ▶", command=lambda: self.month_var.set(self.month_var.get() + 1), style='Small.TButton').pack(side='left', padx=(10, 5))
+        ttk.Button(control_frame, text="다음 년도 ▶▶", command=lambda: self.year_var.set(self.year_var.get() + 1), style='Small.TButton').pack(side='left', padx=(5, 0))
+
+        def on_date_change_cb(*args):
+            try: current_year, current_month = self.year_var.get(), self.month_var.get()
+            except Exception: return
+
+            if current_month > 12:
+                self.year_var.set(current_year + 1)
+                self.month_var.set(1)
+            elif current_month < 1:
+                self.year_var.set(current_year - 1)
+                self.month_var.set(12)
+
+            try: self.display_initial_schedule_table()
+            except Exception as e: logging.error(f"[on_date_change_cb] {e}")
+
+        ttk.Label(self.root, textvariable=self.month_label_text, style='Toss.TLabel').pack(pady=5)
+
+        main_content_frame = ttk.Frame(self.root, style='Toss.TFrame'); main_content_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        self.schedule_frame = ttk.Frame(main_content_frame, relief='flat', borderwidth=0, padding=10, style='Toss.TFrame')
+        self.schedule_frame.pack(side='left', fill='both', expand=True)
+        self.summary_frame = ttk.Frame(main_content_frame, relief='flat', borderwidth=0, padding=10, style='Toss.TFrame')
+        self.summary_frame.pack(side='left', fill='y', padx=(10, 0))
+
+        button_container = ttk.Frame(self.root, style='Toss.TFrame'); button_container.pack(pady=30)
+
+        ttk.Button(button_container, text="✨ 근무표 생성", command=self.generate_and_display, style='Primary.TButton').pack(side='left', padx=10)
+        ttk.Button(button_container, text="🗑️ 근무표 초기화", command=self.clear_schedule, style='Clear.TButton').pack(side='left', padx=10)
+
+        self.year_var.trace_add("write", on_date_change_cb)
+        self.month_var.trace_add("write", on_date_change_cb)
+
+        self.root.after(100, self.load_and_display_data_after_startup)
+
+        footer_frame = ttk.Frame(self.root, style='Toss.TFrame'); footer_frame.pack(side='bottom', fill='x', padx=10, pady=(0, 5))
+        tk.Label(footer_frame, text="made by TKㅣver.24112643", font=('Malgun Gothic', 9), fg='#AAAAAA', bg='white').pack(side='right', padx=10)
+
+    def on_closing(self):
+        self.save_worker_names()
+        self.save_worker_categories()
+        self.save_annual_vacations()
+        self.root.destroy()
+
+    # ------------------------------------------------------------------
+    # [연차 입력 다이얼로그] 🔵 NEW
+    # ------------------------------------------------------------------
+    def annual_vacation_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("연차 입력 / 수정")
+        dialog.geometry("420x600")
+        dialog.transient(self.root); dialog.grab_set()
+
+        tk.Label(dialog, text="근무자별 연차 입력 (년 단위)", font=('Malgun Gothic', 14, 'bold')).pack(pady=10)
+
+        frame_canvas = tk.Frame(dialog)
+        frame_canvas.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # 내부 스크롤 가능한 프레임
+        canvas = tk.Canvas(frame_canvas, borderwidth=0, highlightthickness=0)
+        scroll_y = ttk.Scrollbar(frame_canvas, orient="vertical", command=canvas.yview)
+        inner_frame = ttk.Frame(canvas)
+
+        inner_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=inner_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scroll_y.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll_y.pack(side="right", fill="y")
+
+        entries = {}
+        # 현재 연차 맵에 따라 입력 필드 구성
+        for name in self.worker_names:
+            row = ttk.Frame(inner_frame)
+            row.pack(fill='x', pady=4)
+            ttk.Label(row, text=name, width=12).pack(side='left', padx=(2, 6))
+            val = tk.DoubleVar(value=self.annual_vacations.get(name, 21.5))
+            ent = ttk.Entry(row, textvariable=val, width=10)
+            ent.pack(side='left')
+            entries[name] = val
+
+        def save_data():
+            try:
+                for nm, var in entries.items():
+                    # 안전하게 숫자로
+                    try:
+                        v = float(var.get())
+                    except Exception:
+                        v = 0.0
+                    self.annual_vacations[nm] = round(v, 2)
+                self.save_annual_vacations()
+                messagebox.showinfo("저장", "연차가 저장되었습니다.")
+                dialog.destroy()
+                # 통계 갱신
+                try:
+                    if not self.current_schedule_df.empty:
+                        self.current_summary_df = self.generate_schedule_summary(self.current_schedule_df, self.year_var.get(), self.month_var.get())
+                        self.display_summary_table(self.current_summary_df)
+                except:
+                    pass
+            except Exception as e:
+                logging.error(f"[save_data annual_vacation_dialog] {e}")
+                messagebox.showerror("오류", f"저장 중 오류가 발생했습니다: {e}", parent=dialog)
+
+        btn_frame = ttk.Frame(dialog); btn_frame.pack(pady=8)
+        ttk.Button(btn_frame, text="저장", command=save_data, style='Dialog.Primary.TButton').pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="취소", command=dialog.destroy, style='Dialog.Secondary.TButton').pack(side='left', padx=6)
+
+        self.root.wait_window(dialog)
+
+# ========================================================================
+# 4. 실행 진입점
+# ========================================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ScheduleApp(root)
+    root.mainloop()
